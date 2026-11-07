@@ -1,0 +1,23 @@
+{
+  "name": "gym-access",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test \"packages/*/test/*.test.ts\" \"supabase/test/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "smoke:hikvision": "node scripts/hikvision-smoke.ts",
+    "smoke:whatsapp": "node scripts/whatsapp-smoke.ts"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
