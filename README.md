@@ -116,3 +116,21 @@ Run it as a Windows service (e.g. with NSSM) or a systemd unit so it starts with
 - `.env`, tokens and the service key are never committed (`.gitignore`).
 - Members' phones and face photos are personal data: keep the `faces` bucket private and tell gyms what you store.
 - RLS keeps each gym's staff inside their own gym; staff cannot write the device queue or call `claim_device_jobs`.
+
+
+## Try the staff app on your PC (demo mode)
+
+Needs Node 22.18 or newer. No account, no database to install.
+
+```
+npm install
+npm run web
+```
+
+Open http://localhost:3000, pick **Reception** or **Owner**. The demo runs the real `supabase/schema.sql`
+on a local Postgres (PGlite) and keeps its data in `apps/web/.data`. Delete that folder to start fresh.
+Screens: Members, Record payment (price, discount, credit), Move credit, Import from Excel, Payments report
+(+ download for Excel), Settings (owner only).
+
+Not wired yet in the app: the door sync agent and WhatsApp sending (their code and tests are in `packages/`),
+and real login (Supabase Auth).

@@ -289,6 +289,18 @@ begin
   return v_pay;
 end $$;
 
+-- Owner changes the gym's price and rate. Employees cannot (gyms has no update policy).
+create or replace function set_gym_pricing(p_gym uuid, p_price numeric, p_rate integer) returns gyms
+language plpgsql security definer set search_path = public as $$
+declare g gyms;
+begin
+  if not exists (select 1 from staff where gym_id = p_gym and user_id = auth.uid() and role = 'owner') then
+    raise exception 'only the owner can change prices';
+  end if;
+  update gyms set price_usd = p_price, lbp_rate = p_rate where id = p_gym returning * into g;
+  return g;
+end $$;
+
 -- Gift / advance: money kept on the member, no subscription change.
 create or replace function keep_credit(p_member uuid, p_amount numeric, p_currency text default 'USD', p_note text default null)
 returns credit_entries
@@ -326,7 +338,7 @@ begin
   return v_id;
 end $$;
 
-revoke execute on function credit_balance(uuid), record_payment(uuid, integer, numeric, text, boolean, date),
+revoke execute on function set_gym_pricing(uuid, numeric, integer), credit_balance(uuid), record_payment(uuid, integer, numeric, text, boolean, date),
   keep_credit(uuid, numeric, text, text), transfer_credit(uuid, uuid, numeric, text) from public, anon;
 
 -- ----------------------------------------------------------------- views

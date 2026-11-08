@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/*"
   ],
   "engines": {
     "node": ">=22.18"
@@ -13,7 +14,8 @@
     "test": "node --test \"packages/*/test/*.test.ts\" \"supabase/test/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json",
     "smoke:hikvision": "node scripts/hikvision-smoke.ts",
-    "smoke:whatsapp": "node scripts/whatsapp-smoke.ts"
+    "smoke:whatsapp": "node scripts/whatsapp-smoke.ts",
+    "web": "npm run dev -w @gym/web"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.3.0",

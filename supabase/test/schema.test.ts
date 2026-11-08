@@ -315,3 +315,17 @@ test("member_status shows credit", async () => {
   const r = await rows<{ credit_usd: string }>("select credit_usd from member_status where id = $1", [M1]);
   assert.equal(Number(r[0].credit_usd), 25);
 });
+
+test("only the owner can change price and rate", async () => {
+  const OWNER = "00000000-0000-0000-0000-0000000000a2";
+  await db.exec(`insert into staff (user_id, gym_id, role) values ('${OWNER}', '${GYM_A}', 'owner');`);
+  await asStaff(STAFF_A, async () => {
+    await assert.rejects(db.query("select * from set_gym_pricing($1, 50, 100000)", [GYM_A]), /only the owner/);
+  });
+  await asStaff(OWNER, async () => {
+    const g = (await rows<{ price_usd: string; lbp_rate: number }>("select * from set_gym_pricing($1, 50, 100000)", [GYM_A]))[0];
+    assert.equal(Number(g.price_usd), 50);
+    assert.equal(g.lbp_rate, 100000);
+  });
+  await db.exec(`update gyms set price_usd = 60, lbp_rate = 90000 where id = '${GYM_A}'`);
+});
