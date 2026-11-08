@@ -230,3 +230,88 @@ test("RLS: staff see only their gym, can add payments there (job still queued), 
     assert.deepEqual((await rows<{ full_name: string }>("select full_name from members")).map((r) => r.full_name), ["Karim"]);
   });
 });
+
+// ---------------------------------------------------------------- money / credit
+
+const M1 = "30000000-0000-0000-0000-000000000001";
+const M2 = "30000000-0000-0000-0000-000000000002";
+const MB = "20000000-0000-0000-0000-000000000001"; // Karim, gym B
+
+async function bal(id: string): Promise<number> {
+  return Number((await rows<{ b: string }>("select coalesce(sum(amount_usd), 0) as b from credit_entries where member_id = $1", [id]))[0].b);
+}
+
+test("record_payment: default price, snapshot of price and rate, door job queued", async () => {
+  await db.exec(`insert into members (id, gym_id, full_name) values ('${M1}', '${GYM_A}', 'Rita'), ('${M2}', '${GYM_A}', 'Georges');`);
+  await asStaff(STAFF_A, async () => {
+    const p = (await rows<Record<string, string>>("select * from record_payment($1, 1, 60, 'USD', true, '2026-11-08')", [M1]))[0];
+    assert.equal(Number(p.list_price_usd), 60);
+    assert.equal(Number(p.lbp_rate), 90000);
+    assert.equal(Number(p.discount_usd), 0);
+  });
+  const r = (await rows<{ s: string; e: string }>("select period_start::text s, period_end::text e from payments where member_id = $1", [M1]))[0];
+  assert.deepEqual(r, { s: "2026-11-08", e: "2026-12-07" });
+});
+
+test("record_payment: paying 55 is a $5 discount and still gives the full month; early renewal starts next day", async () => {
+  await asStaff(STAFF_A, async () => {
+    await db.query("select * from record_payment($1, 1, 55, 'USD', true, '2026-11-20')", [M1]);
+  });
+  const r = (await rows<{ s: string; e: string; d: string }>(
+    "select period_start::text s, period_end::text e, discount_usd d from payments where member_id = $1 order by period_start desc limit 1", [M1]))[0];
+  assert.deepEqual(r, { s: "2026-12-08", e: "2027-01-07", d: "5.00" });
+  assert.equal(await bal(M1), 0);
+});
+
+test("overpay and 'keep as credit' both land on the member; credit is used on the next payment", async () => {
+  await asStaff(STAFF_A, async () => {
+    await db.query("select * from record_payment($1, 1, 80, 'USD', true, '2026-11-08')", [M2]); // $20 extra
+    await db.query("select * from keep_credit($1, 900000, 'LBP', 'gift')", [M2]); // 900,000 LL = $10
+  });
+  assert.equal(await bal(M2), 30);
+  await asStaff(STAFF_A, async () => {
+    const p = (await rows<Record<string, string>>("select * from record_payment($1, 1, 30, 'USD', true, '2026-12-08')", [M2]))[0];
+    assert.equal(Number(p.credit_used_usd), 30); // $30 credit + $30 cash = $60
+    assert.equal(Number(p.discount_usd), 0);
+  });
+  assert.equal(await bal(M2), 0);
+});
+
+test("transfer_credit moves money between members and refuses overdraft, self, and other gyms", async () => {
+  await asStaff(STAFF_A, async () => {
+    await db.query("select * from keep_credit($1, 40, 'USD', null)", [M2]);
+    await db.query("select transfer_credit($1, $2, 25, 'gift for a friend')", [M2, M1]);
+  });
+  assert.equal(await bal(M2), 15);
+  assert.equal(await bal(M1), 25);
+  await asStaff(STAFF_A, async () => {
+    await assert.rejects(db.query("select transfer_credit($1, $2, 99)", [M2, M1]), /only .* of credit/);
+    await assert.rejects(db.query("select transfer_credit($1, $1, 1)", [M2]), /different member/);
+    await assert.rejects(db.query("select transfer_credit($1, $2, 1)", [M2, MB]), /not allowed/);
+  });
+  assert.equal(await bal(M2), 15);
+});
+
+test("staff of another gym cannot take payments or read credit; direct ledger writes are blocked", async () => {
+  await asStaff(STAFF_B, async () => {
+    await assert.rejects(db.query("select * from record_payment($1, 1, 60)", [M1]), /not allowed/);
+    assert.equal((await rows("select * from credit_entries")).length, 0);
+  });
+  await asStaff(STAFF_A, async () => {
+    await assert.rejects(db.query("insert into credit_entries (gym_id, member_id, amount_usd, kind) values ($1, $2, 999, 'deposit')", [GYM_A, M1]));
+  });
+});
+
+test("credit_balance only answers for staff of that gym", async () => {
+  await asStaff(STAFF_A, async () => {
+    assert.equal(Number((await rows<{ b: string }>("select credit_balance($1) as b", [M1]))[0].b), 25);
+  });
+  await asStaff(STAFF_B, async () => {
+    assert.equal(Number((await rows<{ b: string }>("select credit_balance($1) as b", [M1]))[0].b), 0);
+  });
+});
+
+test("member_status shows credit", async () => {
+  const r = await rows<{ credit_usd: string }>("select credit_usd from member_status where id = $1", [M1]);
+  assert.equal(Number(r[0].credit_usd), 25);
+});

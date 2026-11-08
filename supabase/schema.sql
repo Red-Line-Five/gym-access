@@ -9,6 +9,8 @@ create table gyms (
   name                     text not null,
   timezone                 text not null default 'Asia/Beirut',
   whatsapp_phone_number_id text,
+  price_usd                numeric(10, 2) not null default 60 check (price_usd > 0),   -- one month
+  lbp_rate                 integer not null default 90000 check (lbp_rate > 0),         -- LL for $1
   created_at               timestamptz not null default now()
 );
 
@@ -43,10 +45,31 @@ create table payments (
   period_start date not null,
   period_end   date not null,                  -- INCLUSIVE last day of access
   recorded_by  uuid,                           -- the employee (auth.users.id)
+  -- Snapshot of the money side, so changing the price or rate later never rewrites history.
+  -- amount/currency = what the client actually handed over.
+  list_price_usd  numeric(12, 2),              -- price of the months bought, at the time
+  credit_used_usd numeric(12, 2) not null default 0,
+  discount_usd    numeric(12, 2) not null default 0,   -- list price minus (cash + credit), when the employee charged less
+  lbp_rate        integer,                     -- LL per $1 at the time
   created_at   timestamptz not null default now(),
   check (period_end >= period_start)
 );
 create index payments_member_idx on payments (member_id, period_end desc);
+
+-- Credit kept on a member (gift, advance, overpayment). Signed USD ledger: balance = sum(amount_usd).
+create table credit_entries (
+  id          uuid primary key default gen_random_uuid(),
+  gym_id      uuid not null references gyms(id) on delete cascade,
+  member_id   uuid not null references members(id) on delete cascade,
+  amount_usd  numeric(12, 2) not null check (amount_usd <> 0),
+  kind        text not null check (kind in ('deposit', 'used', 'transfer_in', 'transfer_out')),
+  payment_id  uuid references payments(id) on delete set null,
+  transfer_id uuid,                            -- same value on both sides of a transfer
+  note        text,
+  recorded_by uuid,
+  created_at  timestamptz not null default now()
+);
+create index credit_entries_member_idx on credit_entries (member_id);
 
 -- Work for the door device. The agent at the gym claims these (outbound polling only).
 create table device_jobs (
@@ -206,12 +229,113 @@ begin
   return n;
 end $$;
 
+-- ------------------------------------------------------- money functions
+-- Staff call these (not raw inserts). They check the caller belongs to the gym, lock the member row so two
+-- employees cannot spend the same credit, and write payment + ledger in one transaction.
+
+create or replace function credit_balance(p_member uuid) returns numeric
+language sql stable security definer set search_path = public as $$
+  select coalesce(sum(amount_usd), 0) from credit_entries where member_id = p_member and is_gym_staff(gym_id);
+$$;
+
+-- Subscription payment. Cash is whatever the employee typed (default: the amount due).
+--   received > due  -> the extra becomes credit      received < due -> recorded as a discount (full months still given)
+create or replace function record_payment(
+  p_member uuid, p_months integer, p_received numeric, p_currency text default 'USD',
+  p_use_credit boolean default true, p_paid_on date default null
+) returns payments
+language plpgsql security definer set search_path = public as $$
+declare
+  m members; g gyms;
+  v_paid_on date; v_end date; v_start date;
+  v_balance numeric; v_price numeric; v_applied numeric; v_due numeric; v_received_usd numeric; v_diff numeric;
+  v_discount numeric := 0; v_pay payments;
+begin
+  select * into m from members where id = p_member for update;
+  if not found or not is_gym_staff(m.gym_id) then raise exception 'not allowed'; end if;
+  if p_months < 1 or p_months > 24 then raise exception 'months must be 1 to 24'; end if;
+  if p_received is null or p_received < 0 then raise exception 'received must be 0 or more'; end if;
+  if p_currency not in ('USD', 'LBP') then raise exception 'currency must be USD or LBP'; end if;
+  select * into g from gyms where id = m.gym_id;
+
+  v_paid_on := coalesce(p_paid_on, (now() at time zone g.timezone)::date);
+  select coalesce(sum(amount_usd), 0) into v_balance from credit_entries where member_id = m.id;
+  v_price := g.price_usd * p_months;
+  v_applied := case when p_use_credit then least(v_balance, v_price) else 0 end;
+  v_due := v_price - v_applied;
+  v_received_usd := round(case when p_currency = 'USD' then p_received else p_received / g.lbp_rate end, 2);
+  v_diff := v_received_usd - v_due;
+
+  -- Early renewal starts the day after the current end; otherwise today. Same rule as core nextPeriod().
+  select max(period_end) into v_end from payments where member_id = m.id;
+  v_start := case when v_end is not null and v_end >= v_paid_on then v_end + 1 else v_paid_on end;
+  if v_diff < -0.005 then v_discount := -v_diff; end if;
+
+  insert into payments (gym_id, member_id, amount, currency, paid_on, period_start, period_end, recorded_by,
+                        list_price_usd, credit_used_usd, discount_usd, lbp_rate)
+  values (m.gym_id, m.id, p_received, p_currency, v_paid_on, v_start,
+          ((v_start + make_interval(months => p_months))::date - 1), auth.uid(),
+          v_price, v_applied, v_discount, g.lbp_rate)
+  returning * into v_pay;
+
+  if v_applied > 0 then
+    insert into credit_entries (gym_id, member_id, amount_usd, kind, payment_id, recorded_by)
+    values (m.gym_id, m.id, -v_applied, 'used', v_pay.id, auth.uid());
+  end if;
+  if v_diff >= 0.01 then
+    insert into credit_entries (gym_id, member_id, amount_usd, kind, payment_id, recorded_by)
+    values (m.gym_id, m.id, v_diff, 'deposit', v_pay.id, auth.uid());
+  end if;
+  return v_pay;
+end $$;
+
+-- Gift / advance: money kept on the member, no subscription change.
+create or replace function keep_credit(p_member uuid, p_amount numeric, p_currency text default 'USD', p_note text default null)
+returns credit_entries
+language plpgsql security definer set search_path = public as $$
+declare m members; g gyms; v_usd numeric; e credit_entries;
+begin
+  select * into m from members where id = p_member for update;
+  if not found or not is_gym_staff(m.gym_id) then raise exception 'not allowed'; end if;
+  if p_currency not in ('USD', 'LBP') then raise exception 'currency must be USD or LBP'; end if;
+  select * into g from gyms where id = m.gym_id;
+  v_usd := round(case when p_currency = 'USD' then p_amount else p_amount / g.lbp_rate end, 2);
+  if v_usd < 0.01 then raise exception 'amount must be above zero'; end if;
+  insert into credit_entries (gym_id, member_id, amount_usd, kind, note, recorded_by)
+  values (m.gym_id, m.id, v_usd, 'deposit', p_note, auth.uid()) returning * into e;
+  return e;
+end $$;
+
+-- Move credit between two members of the same gym. Both rows are locked in id order (no deadlocks).
+create or replace function transfer_credit(p_from uuid, p_to uuid, p_amount numeric, p_note text default null)
+returns uuid
+language plpgsql security definer set search_path = public as $$
+declare a members; b members; v_balance numeric; v_id uuid := gen_random_uuid();
+begin
+  if p_from = p_to then raise exception 'choose a different member'; end if;
+  if p_amount is null or p_amount < 0.01 then raise exception 'amount must be above zero'; end if;
+  perform 1 from members where id in (p_from, p_to) order by id for update;
+  select * into a from members where id = p_from;
+  select * into b from members where id = p_to;
+  if a.id is null or b.id is null or a.gym_id <> b.gym_id or not is_gym_staff(a.gym_id) then raise exception 'not allowed'; end if;
+  select coalesce(sum(amount_usd), 0) into v_balance from credit_entries where member_id = a.id;
+  if p_amount > v_balance then raise exception 'only % of credit available', v_balance; end if;
+  insert into credit_entries (gym_id, member_id, amount_usd, kind, transfer_id, note, recorded_by) values
+    (a.gym_id, a.id, -round(p_amount, 2), 'transfer_out', v_id, p_note, auth.uid()),
+    (a.gym_id, b.id,  round(p_amount, 2), 'transfer_in',  v_id, p_note, auth.uid());
+  return v_id;
+end $$;
+
+revoke execute on function credit_balance(uuid), record_payment(uuid, integer, numeric, text, boolean, date),
+  keep_credit(uuid, numeric, text, text), transfer_credit(uuid, uuid, numeric, text) from public, anon;
+
 -- ----------------------------------------------------------------- views
 
 -- Each member's current end date and whether they are active today (in the GYM's timezone).
 create view member_status with (security_invoker = true) as
 select m.id, m.gym_id, m.full_name, m.phone, m.employee_no,
        max(p.period_end) as end_date,
+       (select coalesce(sum(c.amount_usd), 0) from credit_entries c where c.member_id = m.id) as credit_usd,
        coalesce(max(p.period_end) >= (now() at time zone g.timezone)::date, false) as active
   from members m
   join gyms g on g.id = m.gym_id
@@ -227,6 +351,7 @@ alter table payments      enable row level security;
 alter table device_jobs   enable row level security;
 alter table notifications enable row level security;
 alter table closures      enable row level security;
+alter table credit_entries enable row level security;
 
 create policy gyms_staff on gyms for select using (is_gym_staff(id));
 create policy staff_self on staff for select using (user_id = auth.uid());
@@ -234,6 +359,7 @@ create policy members_staff on members for all using (is_gym_staff(gym_id)) with
 create policy payments_staff on payments for all using (is_gym_staff(gym_id)) with check (is_gym_staff(gym_id));
 create policy jobs_staff_read on device_jobs for select using (is_gym_staff(gym_id));
 create policy notifications_staff_read on notifications for select using (is_gym_staff(gym_id));
+create policy credit_staff_read on credit_entries for select using (is_gym_staff(gym_id));
 create policy closures_staff on closures for all using (is_gym_staff(gym_id)) with check (is_gym_staff(gym_id));
 
 -- Only the agent (service_role) may claim jobs. Supabase grants execute to anon/authenticated by default, so revoke explicitly.
