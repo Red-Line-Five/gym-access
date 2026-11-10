@@ -20,6 +20,8 @@ export default async function Layout({ children }: { children: ReactNode }) {
               <Link href="/members">Members</Link>
               <Link href="/import">Import</Link>
               <Link href="/report">Payments report</Link>
+              <Link href="/closed">Closed days</Link>
+              <Link href="/messages">Messages</Link>
               {s.role === "owner" && <Link href="/settings">Settings</Link>}
             </nav>
           )}

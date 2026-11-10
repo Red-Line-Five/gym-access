@@ -96,6 +96,8 @@ create table notifications (
   kind          text not null check (kind in ('payment_received', 'subscription_expiring', 'gym_closed')),
   period_key    text not null,                 -- payment: period_end, expiring: period_end, closed: the closed date
   status        text not null default 'pending' check (status in ('pending', 'sent', 'delivered', 'read', 'failed')),
+  phone         text not null,                 -- snapshot at the time we decided to send
+  params        jsonb not null,                -- the 3 template variables: [member name, gym name, date]
   wa_message_id text,
   error         text,
   created_at    timestamptz not null default now(),
@@ -228,6 +230,75 @@ begin
   select count(*) into n from ins;
   return n;
 end $$;
+
+-- ------------------------------------------------------ messages & closures
+
+-- Receipt: every real payment queues the "payment received" WhatsApp (not closure extensions).
+create or replace function payments_queue_receipt() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  insert into notifications (gym_id, member_id, kind, period_key, phone, params)
+  select m.gym_id, m.id, 'payment_received', new.period_end::text, m.phone,
+         jsonb_build_array(m.full_name, g.name, to_char(new.period_end, 'DD/MM/YYYY'))
+    from members m join gyms g on g.id = m.gym_id
+   where m.id = new.member_id and coalesce(btrim(m.phone), '') <> ''
+  on conflict do nothing;
+  return new;
+end $$;
+
+create trigger payments_receipt after insert on payments
+  for each row when (new.kind = 'payment') execute function payments_queue_receipt();
+
+-- Reminder: everyone whose subscription ends within p_days (today included), once per period.
+-- Safe to run as often as you like (the unique key stops duplicates), and a missed day is caught up the next day.
+-- Staff may call it, and so may the scheduled job (service_role has no auth.uid()).
+create or replace function queue_expiry_reminders(p_gym uuid, p_days integer default 2) returns integer
+language plpgsql security definer set search_path = public as $$
+declare n integer; v_today date;
+begin
+  if auth.uid() is not null and not is_gym_staff(p_gym) then raise exception 'not allowed'; end if;
+  select (now() at time zone timezone)::date into v_today from gyms where id = p_gym;
+  with ins as (
+    insert into notifications (gym_id, member_id, kind, period_key, phone, params)
+    select s.gym_id, s.id, 'subscription_expiring', s.end_date::text, s.phone,
+           jsonb_build_array(s.full_name, g.name, to_char(s.end_date, 'DD/MM/YYYY'))
+      from member_status s join gyms g on g.id = s.gym_id
+     where s.gym_id = p_gym and coalesce(btrim(s.phone), '') <> ''
+       and s.end_date between v_today and v_today + p_days
+    on conflict do nothing
+    returning 1)
+  select count(*) into n from ins;
+  return n;
+end $$;
+
+-- "Gym closed" button: record the closed day, message EVERY member with a phone, and optionally give
+-- everyone whose subscription covers that day extra days. Returns {notified, extended}.
+create or replace function close_gym(p_gym uuid, p_closed_on date, p_reason text default null, p_extend_days integer default 0)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare v_extended integer := 0; v_notified integer;
+begin
+  if not is_gym_staff(p_gym) then raise exception 'not allowed'; end if;
+  if p_extend_days < 0 or p_extend_days > 7 then raise exception 'extend days must be 0 to 7'; end if;
+  if exists (select 1 from closures where gym_id = p_gym and closed_on = p_closed_on) then
+    raise exception 'this day is already marked as closed';
+  end if;
+  insert into closures (gym_id, closed_on, reason, extend_days, created_by)
+  values (p_gym, p_closed_on, nullif(btrim(p_reason), ''), p_extend_days, auth.uid());
+  if p_extend_days > 0 then v_extended := apply_closure(p_gym, p_closed_on, p_extend_days); end if;
+  with ins as (
+    insert into notifications (gym_id, member_id, kind, period_key, phone, params)
+    select m.gym_id, m.id, 'gym_closed', p_closed_on::text, m.phone,
+           jsonb_build_array(m.full_name, g.name, to_char(p_closed_on, 'DD/MM/YYYY'))
+      from members m join gyms g on g.id = m.gym_id
+     where m.gym_id = p_gym and coalesce(btrim(m.phone), '') <> ''
+    on conflict do nothing
+    returning 1)
+  select count(*) into v_notified from ins;
+  return jsonb_build_object('notified', v_notified, 'extended', v_extended);
+end $$;
+
+revoke execute on function queue_expiry_reminders(uuid, integer), close_gym(uuid, date, text, integer) from public, anon;
 
 -- ------------------------------------------------------- money functions
 -- Staff call these (not raw inserts). They check the caller belongs to the gym, lock the member row so two

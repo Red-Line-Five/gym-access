@@ -185,8 +185,8 @@ test("apply_closure extends everyone covered by the closed day, and only them", 
 });
 
 test("the same notification cannot be recorded twice for a member and period", async () => {
-  const insert = `insert into notifications (gym_id, member_id, kind, period_key)
-                  values ('${GYM_A}', '10000000-0000-0000-0000-000000000001', 'subscription_expiring', '2027-01-07')`;
+  const insert = `insert into notifications (gym_id, member_id, kind, period_key, phone, params)
+                  values ('${GYM_A}', '10000000-0000-0000-0000-000000000001', 'subscription_expiring', '2027-01-07', '71123456', '["Elie","Gym A","07/01/2027"]')`;
   await db.exec(insert);
   await assert.rejects(db.exec(insert), /duplicate key|unique/i);
 });
@@ -328,4 +328,60 @@ test("only the owner can change price and rate", async () => {
     assert.equal(g.lbp_rate, 100000);
   });
   await db.exec(`update gyms set price_usd = 60, lbp_rate = 90000 where id = '${GYM_A}'`);
+});
+
+// ---------------------------------------------------------------- messages & closures
+
+test("a payment queues one receipt with name, gym and end date; extensions and phoneless members do not", async () => {
+  await db.exec(`update members set phone = '03111222' where id = '${M1}'`);
+  await asStaff(STAFF_A, async () => { await db.query("select * from record_payment($1, 1, 60, 'USD', false, '2027-03-01')", [M1]); });
+  const rec = await rows<{ phone: string; params: string[]; status: string }>(
+    "select phone, params, status from notifications where member_id = $1 and kind = 'payment_received'", [M1]);
+  assert.equal(rec.length, 1);
+  assert.equal(rec[0].phone, "03111222");
+  assert.deepEqual(rec[0].params, ["Rita", "Gym A", "31/03/2027"]);
+  assert.equal(rec[0].status, "pending");
+  // a member with no phone gets no message but the payment still works
+  const NP = "30000000-0000-0000-0000-000000000009";
+  await db.exec(`insert into members (id, gym_id, full_name) values ('${NP}', '${GYM_A}', 'No Phone')`);
+  await asStaff(STAFF_A, async () => { await db.query("select * from record_payment($1, 1, 60)", [NP]); });
+  assert.equal((await rows("select 1 from notifications where member_id = $1", [NP])).length, 0);
+});
+
+test("queue_expiry_reminders: once per period, only inside the window, and not for other gyms", async () => {
+  await db.exec(`update members set phone = '03000001' where id = '${M1}' and phone is null`);
+  const today = (await rows<{ d: string }>("select (now() at time zone 'Asia/Beirut')::date::text d"))[0].d;
+  await db.exec(`delete from payments where member_id = '${M2}'; delete from notifications where kind = 'subscription_expiring';
+    update members set phone = '03000002' where id = '${M2}';
+    insert into payments (gym_id, member_id, amount, paid_on, period_start, period_end)
+      values ('${GYM_A}', '${M2}', 60, '${today}'::date - 28, '${today}'::date - 28, '${today}'::date + 2);`);
+  await asStaff(STAFF_A, async () => {
+    const first = Number((await rows<{ n: number }>("select queue_expiry_reminders($1, 2) as n", [GYM_A]))[0].n);
+    assert.equal(first, 1); // M2 ends in 2 days; M1 ends months away
+    const again = Number((await rows<{ n: number }>("select queue_expiry_reminders($1, 2) as n", [GYM_A]))[0].n);
+    assert.equal(again, 0); // no duplicate
+  });
+  await asStaff(STAFF_B, async () => {
+    await assert.rejects(db.query("select queue_expiry_reminders($1, 2)", [GYM_A]), /not allowed/);
+  });
+});
+
+test("close_gym messages everyone with a phone, extends covered subscriptions, and cannot be done twice", async () => {
+  const day = (await rows<{ d: string }>("select ((now() at time zone 'Asia/Beirut')::date + 1)::text d"))[0].d;
+  const before = await rows<{ id: string; end_date: string }>("select id, end_date::text from member_status where gym_id = $1 and end_date >= $2::date", [GYM_A, day]);
+  let result: { notified: number; extended: number } = { notified: 0, extended: 0 };
+  await asStaff(STAFF_A, async () => {
+    result = (await rows<{ r: typeof result }>("select close_gym($1, $2::date, 'maintenance', 1) as r", [GYM_A, day]))[0].r;
+    await assert.rejects(db.query("select close_gym($1, $2::date)", [GYM_A, day]), /already/);
+  });
+  const withPhone = Number((await rows<{ n: string }>("select count(*) n from members where gym_id = $1 and coalesce(btrim(phone), '') <> ''", [GYM_A]))[0].n);
+  assert.equal(result.notified, withPhone);
+  assert.equal(result.extended, before.length);
+  const m = before[0];
+  const after = (await rows<{ end_date: string }>("select end_date::text from member_status where id = $1", [m.id]))[0];
+  assert.equal(after.end_date, (await rows<{ d: string }>("select ($1::date + 1)::text d", [m.end_date]))[0].d);
+  assert.equal((await rows("select 1 from notifications where kind = 'gym_closed' and period_key = $1", [day])).length, withPhone);
+  await asStaff(STAFF_B, async () => {
+    await assert.rejects(db.query("select close_gym($1, $2::date)", [GYM_A, "2030-01-01"]), /not allowed/);
+  });
 });

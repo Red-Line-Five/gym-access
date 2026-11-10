@@ -2,7 +2,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
-import { USERS } from "@/lib/db.ts";
+import { USERS, demoMarkSent } from "@/lib/db.ts";
 import { requireSession, withGym } from "@/lib/session.ts";
 import { usd } from "@/lib/format.ts";
 
@@ -82,4 +82,38 @@ export async function saveSettings(formData: FormData): Promise<void> {
   }
   revalidatePath("/", "layout");
   back("/settings", "done", "Settings saved");
+}
+
+export async function closeGym(formData: FormData): Promise<void> {
+  const s = await requireSession();
+  const day = String(formData.get("day") ?? "");
+  const reason = String(formData.get("reason") ?? "");
+  const extend = Number(formData.get("extend") ?? 0);
+  let message = "";
+  try {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error("Choose the closed day");
+    message = await withGym(s, async (q, gym) => {
+      const [r] = await q<{ r: { notified: number; extended: number } }>("select close_gym($1, $2::date, $3, $4) as r", [gym.id, day, reason, extend]);
+      return `Closed day saved. ${r.r.notified} members will get a WhatsApp message${r.r.extended ? `, ${r.r.extended} subscriptions extended by ${extend} ${extend === 1 ? "day" : "days"}` : ""}.`;
+    });
+  } catch (e) {
+    back("/closed", "error", e instanceof Error ? e.message : "Could not save");
+  }
+  revalidatePath("/", "layout");
+  back("/closed", "done", message);
+}
+
+export async function runReminders(): Promise<void> {
+  const s = await requireSession();
+  const n = await withGym(s, async (q, gym) => Number((await q<{ n: number }>("select queue_expiry_reminders($1, 2) as n", [gym.id]))[0].n));
+  revalidatePath("/messages");
+  back("/messages", "done", n ? `${n} reminders queued` : "No new reminders: nobody is ending in the next 2 days, or they were already reminded");
+}
+
+export async function demoSendPending(): Promise<void> {
+  const s = await requireSession();
+  const ids = await withGym(s, async (q) => (await q<{ id: string }>("select id from notifications where status = 'pending'")).map((r) => r.id));
+  await demoMarkSent(ids);
+  revalidatePath("/messages");
+  back("/messages", "done", `${ids.length} messages marked as sent (demo: nothing was really sent)`);
 }
