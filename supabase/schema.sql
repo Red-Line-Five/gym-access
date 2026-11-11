@@ -100,6 +100,9 @@ create table notifications (
   params        jsonb not null,                -- the 3 template variables: [member name, gym name, date]
   wa_message_id text,
   error         text,
+  attempts      integer not null default 0,
+  run_after     timestamptz not null default now(),
+  locked_at     timestamptz,
   created_at    timestamptz not null default now(),
   unique (member_id, kind, period_key)
 );
@@ -297,6 +300,42 @@ begin
   select count(*) into v_notified from ins;
   return jsonb_build_object('notified', v_notified, 'extended', v_extended);
 end $$;
+
+-- The sender (service_role) claims pending messages. Same safety as the door queue: `skip locked`, and a message
+-- stuck in 'running' for 5 minutes (sender crashed) is handed out again. The attempt is counted on claim.
+create or replace function claim_notifications(p_gym uuid, p_limit integer default 20)
+returns setof notifications language sql as $$
+  update notifications n
+     set status = 'pending', attempts = n.attempts + 1, locked_at = now()
+   where n.id in (
+     select x.id from notifications x
+      where x.gym_id = p_gym and x.run_after <= now()
+        and x.status = 'pending' and (x.locked_at is null or x.locked_at < now() - interval '5 minutes')
+      order by x.created_at, x.id
+      limit p_limit
+      for update skip locked
+   )
+  returning n.*;
+$$;
+
+-- Delivery receipts from WhatsApp can arrive out of order (read before delivered). Never move backwards.
+create or replace function apply_message_status(p_wa_message_id text, p_status text, p_error text default null) returns integer
+language plpgsql as $$
+declare n integer;
+begin
+  -- rank: pending 0 < sent 1 < failed 1.5 < delivered 2 < read 3
+  update notifications
+     set status = p_status, error = case when p_status = 'failed' then p_error else error end
+   where wa_message_id = p_wa_message_id
+     and p_status in ('sent', 'delivered', 'read', 'failed')
+     and (case status when 'pending' then 0 when 'sent' then 1 when 'failed' then 1.5 when 'delivered' then 2 else 3 end)
+       < (case p_status when 'sent' then 1 when 'failed' then 1.5 when 'delivered' then 2 else 3 end);
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+revoke execute on function claim_notifications(uuid, integer), apply_message_status(text, text, text) from public, anon, authenticated;
+grant execute on function claim_notifications(uuid, integer), apply_message_status(text, text, text) to service_role;
 
 revoke execute on function queue_expiry_reminders(uuid, integer), close_gym(uuid, date, text, integer) from public, anon;
 

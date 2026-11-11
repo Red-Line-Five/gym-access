@@ -385,3 +385,57 @@ test("close_gym messages everyone with a phone, extends covered subscriptions, a
     await assert.rejects(db.query("select close_gym($1, $2::date)", [GYM_A, "2030-01-01"]), /not allowed/);
   });
 });
+
+// ---------------------------------------------------------------- sender queue
+
+test("claim_notifications hands each message out once, counts the attempt, and only to the service role", async () => {
+  await db.exec(`delete from notifications; update gyms set name = 'Gym A' where id = '${GYM_A}';
+    update members set phone = '03000001' where id = '${M1}';`);
+  await db.exec(`
+    insert into notifications (gym_id, member_id, kind, period_key, phone, params) values
+      ('${GYM_A}', '${M1}', 'payment_received', 'p1', '03000001', '["Rita","Gym A","01/01/2027"]'),
+      ('${GYM_A}', '${M1}', 'payment_received', 'p2', '03000001', '["Rita","Gym A","01/02/2027"]'),
+      ('${GYM_A}', '${M1}', 'gym_closed', 'p3', '03000001', '["Rita","Gym A","03/02/2027"]');`);
+  await db.exec("set role service_role");
+  const first = await rows<{ id: string; attempts: number }>("select * from claim_notifications($1, 2)", [GYM_A]);
+  const second = await rows<{ id: string }>("select * from claim_notifications($1, 10)", [GYM_A]);
+  const third = await rows("select * from claim_notifications($1, 10)", [GYM_A]);
+  await db.exec("reset role");
+  assert.equal(first.length, 2);
+  assert.equal(first[0].attempts, 1);
+  assert.equal(second.length, 1);
+  assert.ok(!first.some((r) => r.id === second[0].id));
+  assert.equal(third.length, 0);
+  await asStaff(STAFF_A, async () => {
+    await assert.rejects(db.query("select * from claim_notifications($1, 1)", [GYM_A]), /permission denied/);
+  });
+});
+
+test("a claimed message whose sender crashed is handed out again after 5 minutes, and a retry waits for run_after", async () => {
+  await db.exec("update notifications set locked_at = now() - interval '6 minutes' where period_key = 'p3'");
+  await db.exec("update notifications set run_after = now() + interval '1 hour', locked_at = null where period_key = 'p1'");
+  await db.exec("set role service_role");
+  const again = await rows<{ period_key: string; attempts: number }>("select * from claim_notifications($1, 10)", [GYM_A]);
+  await db.exec("reset role");
+  assert.deepEqual(again.map((r) => r.period_key), ["p3"]);
+  assert.equal(again[0].attempts, 2);
+});
+
+test("delivery receipts never move a message backwards, even when they arrive out of order", async () => {
+  await db.exec("update notifications set status = 'sent', wa_message_id = 'wamid.A' where period_key = 'p1'");
+  const apply = async (status: string, err: string | null = null) =>
+    Number((await rows<{ n: number }>("select apply_message_status('wamid.A', $1, $2) as n", [status, err]))[0].n);
+  const status = async () => (await rows<{ status: string }>("select status from notifications where wa_message_id = 'wamid.A'"))[0].status;
+  assert.equal(await apply("read"), 1);
+  assert.equal(await apply("delivered"), 0); // arrived late
+  assert.equal(await apply("sent"), 0);
+  assert.equal(await status(), "read");
+  assert.equal(await apply("bogus"), 0);
+  assert.equal(await apply("read"), 0);
+  // a failure after 'sent' is recorded with its reason
+  await db.exec("update notifications set status = 'sent', wa_message_id = 'wamid.B' where period_key = 'p2'");
+  assert.equal(Number((await rows<{ n: number }>("select apply_message_status('wamid.B', 'failed', '131026 undeliverable') as n"))[0].n), 1);
+  const f = (await rows<{ status: string; error: string }>("select status, error from notifications where wa_message_id = 'wamid.B'"))[0];
+  assert.deepEqual(f, { status: "failed", error: "131026 undeliverable" });
+  assert.equal(Number((await rows<{ n: number }>("select apply_message_status('unknown-id', 'read') as n"))[0].n), 0);
+});

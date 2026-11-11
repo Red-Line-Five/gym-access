@@ -15,7 +15,9 @@
     "typecheck": "tsc -p tsconfig.json",
     "smoke:hikvision": "node scripts/hikvision-smoke.ts",
     "smoke:whatsapp": "node scripts/whatsapp-smoke.ts",
-    "web": "npm run dev -w @gym/web"
+    "web": "npm run dev -w @gym/web",
+    "sender": "node packages/sender/src/main.ts",
+    "agent": "node packages/agent/src/main.ts"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.3.0",

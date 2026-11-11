@@ -134,3 +134,11 @@ Screens: Members, Record payment (price, discount, credit), Move credit, Import 
 
 Not wired yet in the app: the door sync agent and WhatsApp sending (their code and tests are in `packages/`),
 and real login (Supabase Auth).
+
+## WhatsApp sender (needs Supabase + Meta, not in the demo)
+
+`npm run sender` sends the queued messages (receipts, reminders, closed day) through WhatsApp Business every
+10 seconds. It needs `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `GYM_ID`, `WA_PHONE_NUMBER_ID`, `WA_TOKEN` in `.env`.
+Delivery receipts (sent, delivered, read, failed) come back through `handleWebhook` in `packages/sender`,
+which the live web app will expose at `/api/whatsapp/webhook` (needs `WA_APP_SECRET` and `WA_VERIFY_TOKEN`).
+Wrong or expired token: it stops and waits 15 minutes instead of failing every message.
